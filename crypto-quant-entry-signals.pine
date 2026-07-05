@@ -54,7 +54,7 @@ tp1R = input.float(1.0, "1차 목표 (보수적, R배수)", minval=0.1, step=0.1
 tp2R = input.float(2.0, "2차 목표 (공격적, R배수)", minval=0.2, step=0.1, group=grpTP)
 
 grpSig = "⑧ 신호 설정"
-requireDiv = input.bool(false, "다이버전스 필수 (체크 시 신호 수 감소, 정확도 상승)", group=grpSig)
+requireDiv = input.bool(true, "다이버전스 필수 (백테스트 근거로 기본 켜짐 — 끄면 신호 급증, 검증상 손실)", group=grpSig, tooltip="2017~2019 BTC 백테스트: 과매도/과매수 단독 진입은 전 구간 손실(PF 0.6), 다이버전스 필수 시 4h 승률 57%·PF 1.48. 상세는 backtest/RESULTS.md")
 cooldown   = input.int(10, "신호 재발생 최소 간격 (봉)", minval=0, group=grpSig)
 showTable  = input.bool(true, "상태 요약 테이블 표시", group=grpSig)
 
