@@ -52,15 +52,20 @@ class Config:
     require_div: bool = False
     use_trend_filter: bool = False
     cooldown: int = 10
+    disable_macd: bool = False    # ablation: MACD 전환 조건 제거
+    disable_bb: bool = False      # ablation: BB 터치 조건 제거
+    adx_max: float = 0.0          # >0이면 ADX(14)가 이 값 미만일 때만 진입 (레인지 장세 필터)
     # 리스크
     capital: float = 1000.0
     leverage: float = 5.0
     max_loss_pct: float = 10.0     # 원금 대비 최대 손실 한도 %
     use_swing_sl: bool = True
     swing_len: int = 10
+    atr_stop_mult: float = 0.0     # >0이면 스윙 스탑 대신 ATR×배수 스탑 (한도 캡은 유지)
     tp1_r: float = 1.0
     tp2_r: float = 2.0
     tp1_exit_frac: float = 0.5     # 1차 익절 비중
+    be_mode: str = "entry"        # TP1 후 스탑 이동: "entry"=본절, "none"=이동 없음, "buffer"=본절+0.25R
     taker_fee: float = 0.00055    # 사이드당 수수료
     warmup: int = 250
 
@@ -82,6 +87,17 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     pc = df["close"].shift()
     tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
     return rma(tr, n)
+
+def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    up = df["high"].diff()
+    dn = -df["low"].diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    tr = atr(df, n)
+    plus_di = 100 * rma(plus_dm, n) / tr
+    minus_di = 100 * rma(minus_dm, n) / tr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return rma(dx, n)
 
 def barssince(cond: np.ndarray) -> np.ndarray:
     """각 시점에서 cond가 마지막으로 참이었던 이후 경과 봉 수 (참인 봉=0)."""
@@ -174,6 +190,10 @@ def compute_signals(df: pd.DataFrame, c: Config) -> pd.DataFrame:
     macd_up = (h > h1) & (h1 <= h2) | ((m > s) & (m1 <= s1))
     macd_dn = (h < h1) & (h1 >= h2) | ((m < s) & (m1 >= s1))
     macd_up[:2] = macd_dn[:2] = False
+    if c.disable_macd:
+        macd_up = macd_dn = np.ones(n, dtype=bool)
+    if c.disable_bb:
+        bb_lower_touch = bb_upper_touch = np.ones(n, dtype=bool)
     bull_recent = barssince(bull_div) <= c.div_lookback
     bear_recent = barssince(bear_div) <= c.div_lookback
     trend_l = ~np.zeros(n, dtype=bool) if not c.use_trend_filter else (o["close"] > o["ema_slow"]).to_numpy()
@@ -184,8 +204,11 @@ def compute_signals(df: pd.DataFrame, c: Config) -> pd.DataFrame:
     if c.require_div:
         long_base = long_base & bull_recent
         short_base = short_base & bear_recent
-    o["long_trig"] = long_base & bb_lower_touch & macd_up & trend_l
-    o["short_trig"] = short_base & bb_upper_touch & macd_dn & trend_s
+    regime_ok = np.ones(n, dtype=bool)
+    if c.adx_max > 0:
+        regime_ok = (adx(o, 14) < c.adx_max).to_numpy()
+    o["long_trig"] = long_base & bb_lower_touch & macd_up & trend_l & regime_ok
+    o["short_trig"] = short_base & bb_upper_touch & macd_dn & trend_s & regime_ok
     return o
 
 
@@ -236,7 +259,11 @@ def run_backtest(df: pd.DataFrame, c: Config):
                 equity += equity_delta
             if hit_sl:  # 손절(또는 본절) 우선
                 close_qty(pos["qty"], pos["sl"])
-                t.outcome = "TP1+BE" if pos["half_done"] else "SL"
+                if pos["half_done"]:
+                    protected = pos["sl"] >= pos["entry"] if side == "L" else pos["sl"] <= pos["entry"]
+                    t.outcome = "TP1+BE" if protected else "TP1+SL"
+                else:
+                    t.outcome = "SL"
                 filled_exit = True
             else:
                 if (not pos["half_done"]) and hit_tp1:
@@ -244,7 +271,12 @@ def run_backtest(df: pd.DataFrame, c: Config):
                     close_qty(q, pos["tp1"])
                     pos["qty"] -= q
                     pos["half_done"] = True
-                    pos["sl"] = pos["entry"]  # 본절 이동
+                    if c.be_mode == "entry":       # 본절 이동
+                        pos["sl"] = pos["entry"]
+                    elif c.be_mode == "buffer":    # 본절 + 0.25R 이익 보호
+                        buf = 0.25 * pos["rr"]
+                        pos["sl"] = pos["entry"] + buf if side == "L" else pos["entry"] - buf
+                    # "none"이면 원래 손절가 유지
                 if pos["half_done"] and hit_tp2:
                     close_qty(pos["qty"], pos["tp2"])
                     t.outcome = "TP1+TP2"
@@ -267,16 +299,18 @@ def run_backtest(df: pd.DataFrame, c: Config):
                 entry = cl[i]
                 if is_long:
                     sl_cap = entry * (1 - stop_frac)
-                    sl_sw = o["swing_low"].iloc[i] - 0.5 * o["atr"].iloc[i]
-                    sl = max(sl_cap, sl_sw) if c.use_swing_sl else sl_cap
+                    sl_struct = (entry - c.atr_stop_mult * o["atr"].iloc[i]) if c.atr_stop_mult > 0 \
+                        else o["swing_low"].iloc[i] - 0.5 * o["atr"].iloc[i]
+                    sl = max(sl_cap, sl_struct) if (c.use_swing_sl or c.atr_stop_mult > 0) else sl_cap
                     if sl >= entry:
                         sl = sl_cap
                     rr = entry - sl
                     tp1, tp2 = entry + rr * c.tp1_r, entry + rr * c.tp2_r
                 else:
                     sl_cap = entry * (1 + stop_frac)
-                    sl_sw = o["swing_high"].iloc[i] + 0.5 * o["atr"].iloc[i]
-                    sl = min(sl_cap, sl_sw) if c.use_swing_sl else sl_cap
+                    sl_struct = (entry + c.atr_stop_mult * o["atr"].iloc[i]) if c.atr_stop_mult > 0 \
+                        else o["swing_high"].iloc[i] + 0.5 * o["atr"].iloc[i]
+                    sl = min(sl_cap, sl_struct) if (c.use_swing_sl or c.atr_stop_mult > 0) else sl_cap
                     if sl <= entry:
                         sl = sl_cap
                     rr = sl - entry
@@ -284,7 +318,7 @@ def run_backtest(df: pd.DataFrame, c: Config):
                 notional = equity * c.leverage
                 qty = notional / entry
                 equity -= notional * c.taker_fee  # 진입 수수료
-                pos = dict(side="L" if is_long else "S", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+                pos = dict(side="L" if is_long else "S", entry=entry, sl=sl, tp1=tp1, tp2=tp2, rr=rr,
                            qty=qty, half_done=False, eq0=equity + notional * c.taker_fee,
                            trade=Trade("LONG" if is_long else "SHORT", times[i], entry, sl, tp1, tp2))
 
@@ -320,7 +354,7 @@ def summarize(name: str, trades: list, final_eq: float, eq_curve: np.ndarray, c:
         "트레이드": n,
         "승률%": round(len(wins) / n * 100, 1),
         "TP2도달": outcomes.get("TP1+TP2", 0),
-        "TP1+본절": outcomes.get("TP1+BE", 0),
+        "TP1+본절": outcomes.get("TP1+BE", 0) + outcomes.get("TP1+SL", 0),
         "손절": outcomes.get("SL", 0),
         "PF": round(gross_p / gross_l, 2) if gross_l > 0 else float("inf"),
         "평균손익%": round(np.mean([t.pnl_pct_capital for t in trades]), 2),
