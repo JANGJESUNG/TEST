@@ -56,7 +56,8 @@ tp2R = input.float(2.0, "2차 목표 (공격적, R배수)", minval=0.2, step=0.1
 grpSig = "⑧ 신호 설정"
 requireDiv = input.bool(true, "다이버전스 필수 (백테스트 근거로 기본 켜짐 — 끄면 신호 급증, 검증상 손실)", group=grpSig, tooltip="2017~2019 BTC 백테스트: 과매도/과매수 단독 진입은 전 구간 손실(PF 0.6), 다이버전스 필수 시 4h 승률 57%·PF 1.48. 상세는 backtest/RESULTS.md")
 useAdxFilter = input.bool(true, "ADX 레인지 필터 (강한 추세장에서 역추세 진입 차단)", group=grpSig, tooltip="다중 자산·다중 시장 백테스트에서 가장 큰 개선 요인. ADX(14)가 기준 미만인 레인지 장세에서만 진입. 필터 없음 PF 1.02 → ADX<25 PF 1.50~1.65. 상세는 backtest/RESULTS.md 2차 검증")
-adxMax = input.float(25, "ADX 상한 (이 값 미만일 때만 진입)", minval=10, maxval=50, step=1, group=grpSig)
+adxMax = input.float(20, "ADX 상한 (이 값 미만일 때만 진입)", minval=10, maxval=50, step=1, group=grpSig, tooltip="3차 개편(2024~2026 실전 검증 피드백)으로 기본 25→20. 더 엄격한 레인지 필터로 수수료 대비 신호 질 향상 (검증 PF 1.65→2.00)")
+useShortTrendFilter = input.bool(false, "숏은 EMA200 아래에서만 (완만한 상승장 숏 차단)", group=grpSig, tooltip="2024~2026처럼 완만하게 우상향하는 장에서 역추세 숏이 깎일 때 켜는 옵션. 2017~2019 검증 데이터에서는 성과를 낮췄으므로 기본 꺼짐 — 본인 심볼/기간에서 Strategy Tester로 A/B 후 결정")
 cooldown   = input.int(10, "신호 재발생 최소 간격 (봉)", minval=0, group=grpSig)
 showTable  = input.bool(true, "상태 요약 테이블 표시", group=grpSig)
 
@@ -111,8 +112,9 @@ trendOkShort = not useTrendFilter or close < emaSlow
 regimeOk     = not useAdxFilter or adxVal < adxMax   // 레인지 장세 확인 (역추세 전략 보호)
 // ── 롱: (과매도 or 상승다이버전스) + BB 하단 지지 + MACD 상방 전환 + 레인지 장세 ──
 longTrigger  = (oversoldRecent or bullDivRecent) and (not requireDiv or bullDivRecent) and bbLowerTouch and macdTurnUp and trendOkLong and regimeOk
+shortSideOk  = not useShortTrendFilter or close < emaSlow
 // ── 숏: (과매수 or 하락다이버전스) + BB 상단 저항 + MACD 하방 전환 + 레인지 장세 ──
-shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk
+shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk and shortSideOk
 
 // ── 쿨다운: 직전 신호 후 일정 봉 수 이내 재신호 금지 ──
 var int lastSignalBar = -99999

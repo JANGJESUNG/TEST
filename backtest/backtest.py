@@ -55,6 +55,8 @@ class Config:
     disable_macd: bool = False    # ablation: MACD 전환 조건 제거
     disable_bb: bool = False      # ablation: BB 터치 조건 제거
     adx_max: float = 0.0          # >0이면 ADX(14)가 이 값 미만일 때만 진입 (레인지 장세 필터)
+    require_oversold_too: bool = False  # 다이버전스 AND 과매도/과매수 동시 요구 (더 엄격)
+    short_only_trend: bool = False      # 숏만 EMA200 아래에서 허용 (완만한 상승장 숏 차단)
     # 리스크
     capital: float = 1000.0
     leverage: float = 5.0
@@ -204,6 +206,11 @@ def compute_signals(df: pd.DataFrame, c: Config) -> pd.DataFrame:
     if c.require_div:
         long_base = long_base & bull_recent
         short_base = short_base & bear_recent
+    if c.require_oversold_too:
+        long_base = long_base & bull_recent & oversold_recent
+        short_base = short_base & bear_recent & overbought_recent
+    if c.short_only_trend:
+        trend_s = trend_s & (o["close"] < o["ema_slow"]).to_numpy()
     regime_ok = np.ones(n, dtype=bool)
     if c.adx_max > 0:
         regime_ok = (adx(o, 14) < c.adx_max).to_numpy()

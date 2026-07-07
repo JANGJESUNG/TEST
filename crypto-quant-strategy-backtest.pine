@@ -10,8 +10,12 @@
 // 백테스트 결론 (backtest/RESULTS.md):
 //   · 1차(BTC 17-19): 다이버전스 필수 모드만 유효 → requireDiv 기본 켜짐
 //   · 2차(BTC/ETH/LTC/EURUSD/GOOGL 8개 데이터셋): 역추세 전략 특성상
-//     강한 추세장에서 무너짐 → ADX(14)<25 레인지 필터 추가 (풀링 PF 1.02→1.50)
+//     강한 추세장에서 무너짐 → ADX(14) 레인지 필터 추가 (풀링 PF 1.02→1.50)
 //     TP1 청산 비중 50%→30% 변경 (풀링 PF 추가 개선, 1.65)
+//   · 3차(2024~2026 트레이딩뷰 실전 검증 피드백): 수수료 드래그·완만한
+//     상승장 숏 손실 대응 → ADX 상한 25→20 (풀링 PF 2.00, 스트레스
+//     수수료 0.08%에서도 1.92), TP1 비중 0%(=본절 이동만) 옵션 지원,
+//     "숏은 EMA200 아래에서만" 토글 추가 (기본 꺼짐)
 //   · 권장: 1h~4h · 레버리지 2x · 트레이드당 리스크 4% · TP1=1R/TP2=3R
 // ─────────────────────────────────────────────────────────────────────────────
 strategy("퀀트 타점 전략 [백테스트]", shorttitle="퀀트 전략BT", overlay=true,
@@ -40,7 +44,8 @@ macdSlow = input.int(26, "MACD 장기", group="MACD")
 macdSig  = input.int(9,  "MACD 시그널", group="MACD")
 requireDiv = input.bool(true, "다이버전스 필수 (백테스트 근거로 기본 켜짐)", group="신호")
 useAdxFilter = input.bool(true, "ADX 레인지 필터 (2차 백테스트 근거로 기본 켜짐)", group="신호")
-adxMax = input.float(25, "ADX 상한", minval=10, maxval=50, step=1, group="신호")
+adxMax = input.float(20, "ADX 상한", minval=10, maxval=50, step=1, group="신호", tooltip="3차 개편: 기본 25→20 (검증 PF 1.65→2.00, 신호 수 감소·질 향상)")
+useShortTrendFilter = input.bool(false, "숏은 EMA200 아래에서만", group="신호", tooltip="완만한 상승장에서 숏이 깎일 때 켜는 옵션. 2017~2019 데이터에서는 성과를 낮췄으므로 기본 꺼짐 — 본인 심볼/기간에서 A/B 후 결정")
 cooldown   = input.int(10, "신호 쿨다운 (봉)", group="신호")
 leverage   = input.float(2,  "레버리지 (배)", minval=1, step=0.5, group="리스크")
 maxLossPct = input.float(4,  "원금 대비 최대 손실 한도 (%)", minval=0.5, step=0.5, group="리스크")
@@ -48,7 +53,7 @@ useSwingSL = input.bool(true, "구조적 스탑 병행", group="리스크")
 swingLen   = input.int(10, "스윙 탐색 봉 수", group="리스크")
 tp1R = input.float(1.0, "1차 목표 (R)", step=0.1, group="익절")
 tp2R = input.float(3.0, "2차 목표 (R)", step=0.1, group="익절")
-tp1Pct = input.float(30, "1차 익절 비중 (%)", minval=10, maxval=90, step=5, group="익절", tooltip="2차 백테스트 근거로 기본 30% (50%→30% 변경 시 풀링 PF 개선)")
+tp1Pct = input.float(30, "1차 익절 비중 (%)", minval=0, maxval=90, step=5, group="익절", tooltip="기본 30%. 0으로 설정하면 'TP1 없음 모드' — 1차 목표(1R) 터치 시 손절만 본절로 이동하고 전량 2차 목표(3R)를 노림. 검증상 기대값 최고(PF 2.25)지만 승률이 29%로 낮아져 연속 손절 구간을 견뎌야 함. 수수료 부담이 클 때 고려")
 
 // ═══ 지표 계산 ═══
 emaSlow = ta.ema(close, emaSlowLen)
@@ -82,8 +87,9 @@ macdTurnDown = (hist < hist[1] and hist[1] >= hist[2]) or ta.crossunder(macdLine
 trendOkLong  = not useTrendFilter or close > emaSlow
 trendOkShort = not useTrendFilter or close < emaSlow
 regimeOk = not useAdxFilter or adxVal < adxMax
+shortSideOk = not useShortTrendFilter or close < emaSlow
 longTrigger  = (oversoldRecent or bullDivRecent) and (not requireDiv or bullDivRecent) and bbLowerTouch and macdTurnUp and trendOkLong and regimeOk
-shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk
+shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk and shortSideOk
 
 var int lastSignalBar = -99999
 canSignal = bar_index - lastSignalBar > cooldown
@@ -116,15 +122,18 @@ if longSignal or shortSignal
     beMoved := false
     strategy.entry(isLong ? "롱" : "숏", isLong ? strategy.long : strategy.short, qty=qty0)
 
-// TP1 체결(1차 부분 청산) 감지 → 잔량 손절을 본절로 이동
-if not na(qty0) and strategy.position_size != 0 and math.abs(strategy.position_size) < qty0 * (1 - tp1Pct / 200)
+// 1차 목표(TP1) 레벨 터치 시 잔량 손절을 본절로 이동 (tp1Pct=0 모드에서도 동작)
+if strategy.position_size > 0 and high >= tp1Lvl
+    beMoved := true
+if strategy.position_size < 0 and low <= tp1Lvl
     beMoved := true
 effStop = beMoved ? entryPx : slLvl
 
 if strategy.position_size != 0
     from = strategy.position_size > 0 ? "롱" : "숏"
-    strategy.exit("TP1/SL", from_entry=from, qty_percent=tp1Pct, limit=tp1Lvl, stop=effStop)
-    strategy.exit("TP2/SL", from_entry=from, qty_percent=100,    limit=tp2Lvl, stop=effStop)
+    if tp1Pct > 0
+        strategy.exit("TP1/SL", from_entry=from, qty_percent=tp1Pct, limit=tp1Lvl, stop=effStop)
+    strategy.exit("TP2/SL", from_entry=from, qty_percent=100, limit=tp2Lvl, stop=effStop)
 
 // ═══ 차트 표시 ═══
 plot(emaSlow, "EMA 200", color=color.new(color.purple, 0), linewidth=2)
