@@ -240,8 +240,8 @@ class Trade:
     outcome: str = ""      # SL / TP1+BE / TP1+TP2 / EOD
     pnl_pct_capital: float = 0.0  # 원금 대비 순손익 %
 
-def run_backtest(df: pd.DataFrame, c: Config):
-    o = compute_signals(df, c)
+def run_backtest(df: pd.DataFrame, c: Config, signal_fn=None):
+    o = (signal_fn or compute_signals)(df, c)
     n = len(o)
     stop_frac = c.max_loss_pct / c.leverage / 100.0
 
