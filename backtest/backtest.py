@@ -57,6 +57,8 @@ class Config:
     adx_max: float = 0.0          # >0이면 ADX(14)가 이 값 미만일 때만 진입 (레인지 장세 필터)
     require_oversold_too: bool = False  # 다이버전스 AND 과매도/과매수 동시 요구 (더 엄격)
     short_only_trend: bool = False      # 숏만 EMA200 아래에서 허용 (완만한 상승장 숏 차단)
+    htf_rule: str = ""            # 상위 타임프레임 규칙 (예: "1D") — 설정 시 HTF ADX 게이트 활성
+    htf_adx_max: float = 25.0     # HTF ADX가 이 값 미만일 때만 진입 (전일 확정값 사용, 미래참조 없음)
     # 리스크
     capital: float = 1000.0
     leverage: float = 5.0
@@ -214,6 +216,12 @@ def compute_signals(df: pd.DataFrame, c: Config) -> pd.DataFrame:
     regime_ok = np.ones(n, dtype=bool)
     if c.adx_max > 0:
         regime_ok = (adx(o, 14) < c.adx_max).to_numpy()
+    if c.htf_rule:
+        htf = o[["open", "high", "low", "close"]].resample(c.htf_rule).agg(
+            open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last")).dropna()
+        # 직전 HTF 봉의 확정 ADX만 사용 (미래참조 방지)
+        htf_adx = adx(htf, 14).shift(1).reindex(o.index, method="ffill")
+        regime_ok = regime_ok & (htf_adx < c.htf_adx_max).fillna(False).to_numpy()
     o["long_trig"] = long_base & bb_lower_touch & macd_up & trend_l & regime_ok
     o["short_trig"] = short_base & bb_upper_touch & macd_dn & trend_s & regime_ok
     return o
