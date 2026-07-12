@@ -1,0 +1,147 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// 퀀트 진입 타점 전략 — 백테스트용 strategy() 버전
+//
+// crypto-quant-entry-signals.pine (지표)과 동일한 신호 로직을 트레이딩뷰
+// Strategy Tester에서 검증할 수 있게 만든 버전.
+// 비트겟/바이비트 무기한 심볼(예: BYBIT:BTCUSDT.P)에 올려 최신 데이터로
+// 성과를 직접 확인하는 용도.
+//
+// 백테스트 결론 (backtest/RESULTS.md):
+//   · 1차(BTC 17-19): 다이버전스 필수 모드만 유효 → requireDiv 기본 켜짐
+//   · 2차(BTC/ETH/LTC/EURUSD/GOOGL 8개 데이터셋): 역추세 전략 특성상
+//     강한 추세장에서 무너짐 → ADX(14) 레인지 필터 추가 (풀링 PF 1.02→1.50)
+//     TP1 청산 비중 50%→30% 변경 (풀링 PF 추가 개선, 1.65)
+//   · 3차(2024~2026 트레이딩뷰 실전 검증 피드백): 수수료 드래그·완만한
+//     상승장 숏 손실 대응 → ADX 상한 25→20 (풀링 PF 2.00, 스트레스
+//     수수료 0.08%에서도 1.92), TP1 비중 0%(=본절 이동만) 옵션 지원,
+//     "숏은 EMA200 아래에서만" 토글 추가 (기본 꺼짐)
+//   · 권장: 1h~4h · 레버리지 2x · 트레이드당 리스크 4% · TP1=1R/TP2=3R
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("퀀트 타점 전략 [백테스트]", shorttitle="퀀트 전략BT", overlay=true,
+  initial_capital=1000, currency=currency.USDT,
+  commission_type=strategy.commission.percent, commission_value=0.055,
+  process_orders_on_close=true, calc_on_every_tick=false,
+  max_labels_count=500)
+
+// ═══ 입력값 (지표 버전과 동일) ═══
+emaSlowLen  = input.int(200, "장기 EMA", group="추세")
+useTrendFilter = input.bool(false, "추세 필터 (EMA200 위=롱만/아래=숏만)", group="추세")
+bbLen  = input.int(20, "BB 기간", group="볼린저 밴드")
+bbMult = input.float(2.0, "BB 배수", step=0.1, group="볼린저 밴드")
+bbLookback = input.int(5, "밴드 터치 인정 봉 수", group="볼린저 밴드")
+rsiLen = input.int(14, "RSI 기간", group="RSI")
+rsiOB  = input.float(70, "과매수", group="RSI")
+rsiOS  = input.float(30, "과매도", group="RSI")
+osLookback = input.int(5, "과열 인정 봉 수", group="RSI")
+lbL = input.int(5, "피벗 왼쪽", group="다이버전스")
+lbR = input.int(3, "피벗 오른쪽", group="다이버전스")
+rangeLower = input.int(5, "피벗 최소 간격", group="다이버전스")
+rangeUpper = input.int(60, "피벗 최대 간격", group="다이버전스")
+divLookback = input.int(5, "다이버전스 인정 봉 수", group="다이버전스")
+macdFast = input.int(12, "MACD 단기", group="MACD")
+macdSlow = input.int(26, "MACD 장기", group="MACD")
+macdSig  = input.int(9,  "MACD 시그널", group="MACD")
+requireDiv = input.bool(true, "다이버전스 필수 (백테스트 근거로 기본 켜짐)", group="신호")
+useAdxFilter = input.bool(true, "ADX 레인지 필터 (2차 백테스트 근거로 기본 켜짐)", group="신호")
+adxMax = input.float(20, "ADX 상한", minval=10, maxval=50, step=1, group="신호", tooltip="3차 개편: 기본 25→20 (검증 PF 1.65→2.00, 신호 수 감소·질 향상)")
+useShortTrendFilter = input.bool(false, "숏은 EMA200 아래에서만", group="신호", tooltip="완만한 상승장에서 숏이 깎일 때 켜는 옵션. 2017~2019 데이터에서는 성과를 낮췄으므로 기본 꺼짐 — 본인 심볼/기간에서 A/B 후 결정")
+cooldown   = input.int(10, "신호 쿨다운 (봉)", group="신호")
+leverage   = input.float(2,  "레버리지 (배)", minval=1, step=0.5, group="리스크")
+maxLossPct = input.float(4,  "원금 대비 최대 손실 한도 (%)", minval=0.5, step=0.5, group="리스크")
+useSwingSL = input.bool(true, "구조적 스탑 병행", group="리스크")
+swingLen   = input.int(10, "스윙 탐색 봉 수", group="리스크")
+tp1R = input.float(1.0, "1차 목표 (R)", step=0.1, group="익절")
+tp2R = input.float(3.0, "2차 목표 (R)", step=0.1, group="익절")
+tp1Pct = input.float(30, "1차 익절 비중 (%)", minval=0, maxval=90, step=5, group="익절", tooltip="기본 30%. 0으로 설정하면 'TP1 없음 모드' — 1차 목표(1R) 터치 시 손절만 본절로 이동하고 전량 2차 목표(3R)를 노림. 검증상 기대값 최고(PF 2.25)지만 승률이 29%로 낮아져 연속 손절 구간을 견뎌야 함. 수수료 부담이 클 때 고려")
+
+// ═══ 지표 계산 ═══
+emaSlow = ta.ema(close, emaSlowLen)
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+rsi = ta.rsi(close, rsiLen)
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+atr = ta.atr(14)
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// ═══ 다이버전스 ═══
+_inRange(cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+plFound = not na(ta.pivotlow(rsi, lbL, lbR))
+bullDiv = plFound and rsi[lbR] > ta.valuewhen(plFound, rsi[lbR], 1) and low[lbR] < ta.valuewhen(plFound, low[lbR], 1) and _inRange(plFound[1])
+phFound = not na(ta.pivothigh(rsi, lbL, lbR))
+bearDiv = phFound and rsi[lbR] < ta.valuewhen(phFound, rsi[lbR], 1) and high[lbR] > ta.valuewhen(phFound, high[lbR], 1) and _inRange(phFound[1])
+bullDivRecent = ta.barssince(bullDiv) <= divLookback
+bearDivRecent = ta.barssince(bearDiv) <= divLookback
+
+// ═══ 진입 조건 (지표 버전과 동일) ═══
+oversoldRecent   = ta.barssince(rsi < rsiOS) <= osLookback
+overboughtRecent = ta.barssince(rsi > rsiOB) <= osLookback
+bbLowerTouch = ta.barssince(low  <= bbLower) <= bbLookback
+bbUpperTouch = ta.barssince(high >= bbUpper) <= bbLookback
+macdTurnUp   = (hist > hist[1] and hist[1] <= hist[2]) or ta.crossover(macdLine, signalLine)
+macdTurnDown = (hist < hist[1] and hist[1] >= hist[2]) or ta.crossunder(macdLine, signalLine)
+trendOkLong  = not useTrendFilter or close > emaSlow
+trendOkShort = not useTrendFilter or close < emaSlow
+regimeOk = not useAdxFilter or adxVal < adxMax
+shortSideOk = not useShortTrendFilter or close < emaSlow
+longTrigger  = (oversoldRecent or bullDivRecent) and (not requireDiv or bullDivRecent) and bbLowerTouch and macdTurnUp and trendOkLong and regimeOk
+shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk and shortSideOk
+
+var int lastSignalBar = -99999
+canSignal = bar_index - lastSignalBar > cooldown
+flat = strategy.position_size == 0
+longSignal  = longTrigger and canSignal and flat and barstate.isconfirmed
+shortSignal = shortTrigger and not longTrigger and canSignal and flat and barstate.isconfirmed
+
+// ═══ 손절/익절 및 주문 ═══
+priceStopPct = maxLossPct / leverage / 100.0
+var float slLvl = na
+var float tp1Lvl = na
+var float tp2Lvl = na
+var float entryPx = na
+var float qty0 = na
+var bool  beMoved = false
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+    entryPx := close
+    isLong = longSignal
+    slCap = isLong ? entryPx * (1 - priceStopPct) : entryPx * (1 + priceStopPct)
+    slSwing = isLong ? ta.lowest(low, swingLen) - 0.5 * atr : ta.highest(high, swingLen) + 0.5 * atr
+    slLvl := not useSwingSL ? slCap : isLong ? math.max(slCap, slSwing) : math.min(slCap, slSwing)
+    if (isLong and slLvl >= entryPx) or (not isLong and slLvl <= entryPx)
+        slLvl := slCap
+    r = math.abs(entryPx - slLvl)
+    tp1Lvl := isLong ? entryPx + r * tp1R : entryPx - r * tp1R
+    tp2Lvl := isLong ? entryPx + r * tp2R : entryPx - r * tp2R
+    qty0 := strategy.equity * leverage / close
+    beMoved := false
+    strategy.entry(isLong ? "롱" : "숏", isLong ? strategy.long : strategy.short, qty=qty0)
+
+// 1차 목표(TP1) 레벨 터치 시 잔량 손절을 본절로 이동 (tp1Pct=0 모드에서도 동작)
+if strategy.position_size > 0 and high >= tp1Lvl
+    beMoved := true
+if strategy.position_size < 0 and low <= tp1Lvl
+    beMoved := true
+effStop = beMoved ? entryPx : slLvl
+
+if strategy.position_size != 0
+    from = strategy.position_size > 0 ? "롱" : "숏"
+    if tp1Pct > 0
+        strategy.exit("TP1/SL", from_entry=from, qty_percent=tp1Pct, limit=tp1Lvl, stop=effStop)
+    strategy.exit("TP2/SL", from_entry=from, qty_percent=100, limit=tp2Lvl, stop=effStop)
+
+// ═══ 차트 표시 ═══
+plot(emaSlow, "EMA 200", color=color.new(color.purple, 0), linewidth=2)
+pU = plot(bbUpper, "BB 상단", color=color.new(color.blue, 55))
+pL = plot(bbLower, "BB 하단", color=color.new(color.blue, 55))
+fill(pU, pL, color=color.new(color.blue, 96))
+plot(strategy.position_size != 0 ? effStop : na, "손절선", color=color.red,  style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? tp1Lvl  : na, "TP1",   color=color.green, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? tp2Lvl  : na, "TP2",   color=color.lime,  style=plot.style_linebr, linewidth=1)
+plotshape(longSignal,  "롱", shape.triangleup,   location.belowbar, color.new(color.teal, 0),   size=size.small)
+plotshape(shortSignal, "숏", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size=size.small)

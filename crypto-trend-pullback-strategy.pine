@@ -1,0 +1,101 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// 추세 눌림목 전략 — 백테스트용 strategy() 버전
+// crypto-trend-pullback-signals.pine (지표)과 동일한 신호 로직.
+// 비트겟/바이비트 무기한 심볼(예: BYBIT:BTCUSDT.P) 1h~4h에 올려
+// Strategy Tester로 최신 구간 성과를 검증하는 용도.
+//
+// 검증 요약 (backtest/RESULTS.md 6차):
+//   풀링 567 트레이드 PF 1.13 (수수료 0.08% 스트레스에서 1.08)
+//   BTC 1h 270 트레이드 PF 1.35 · 누적 +261% (2017~2019)
+//   크립토 일봉은 검증 실패 → 인트라데이 전용
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("추세 눌림목 전략 [백테스트]", shorttitle="눌림목 전략BT", overlay=true,
+  initial_capital=1000, currency=currency.USDT,
+  commission_type=strategy.commission.percent, commission_value=0.055,
+  process_orders_on_close=true, calc_on_every_tick=false, max_labels_count=500)
+
+// ═══ 입력값 (지표 버전과 동일) ═══
+emaFastLen = input.int(20,  "단기 EMA", group="추세")
+emaMidLen  = input.int(50,  "중기 EMA", group="추세")
+emaSlowLen = input.int(200, "장기 EMA", group="추세")
+pullLookback = input.int(5, "눌림 인정 봉 수", group="눌림목")
+rsiLen = input.int(14, "RSI 기간", group="눌림목")
+rsiMid = input.float(50, "RSI 되돌림 기준", minval=30, maxval=70, group="눌림목")
+leverage   = input.float(2, "레버리지 (배)", minval=1, step=0.5, group="리스크")
+maxLossPct = input.float(4, "원금 대비 최대 손실 한도 (%)", minval=0.5, step=0.5, group="리스크", tooltip="검증 설정: 4% ÷ 2배 = 손절폭 2%. 리스크 축소는 한도·레버리지를 같은 비율로")
+swingLen   = input.int(10, "스윙 탐색 봉 수", minval=2, group="리스크")
+tp1R = input.float(1.0, "1차 목표 (R)", step=0.1, group="익절")
+tp2R = input.float(4.0, "2차 목표 (R)", step=0.1, group="익절")
+tp1Pct = input.float(30, "1차 익절 비중 (%)", minval=0, maxval=90, step=5, group="익절", tooltip="0 = TP1 없이 1R 터치 시 본절 이동만")
+cooldown = input.int(10, "신호 쿨다운 (봉)", group="신호")
+
+// ═══ 지표 및 신호 (지표 버전과 동일) ═══
+ema20  = ta.ema(close, emaFastLen)
+ema50  = ta.ema(close, emaMidLen)
+ema200 = ta.ema(close, emaSlowLen)
+rsi = ta.rsi(close, rsiLen)
+atr = ta.atr(14)
+
+upTrend = ema20 > ema50 and ema50 > ema200 and close > ema200
+dnTrend = ema20 < ema50 and ema50 < ema200 and close < ema200
+pullL = ta.barssince(low  <= ema20) <= pullLookback
+pullS = ta.barssince(high >= ema20) <= pullLookback
+dipL  = ta.barssince(rsi < rsiMid) <= pullLookback
+popS  = ta.barssince(rsi > 100 - rsiMid) <= pullLookback
+crossUp = close > ema20 and not (close[1] > ema20[1])
+crossDn = close < ema20 and not (close[1] < ema20[1])
+momUp = close > high[1]
+momDn = close < low[1]
+
+var int lastSignalBar = -99999
+canSignal = bar_index - lastSignalBar > cooldown
+flat = strategy.position_size == 0
+longSignal  = upTrend and pullL and dipL and crossUp and momUp and canSignal and flat and barstate.isconfirmed
+shortSignal = dnTrend and pullS and popS and crossDn and momDn and not longSignal and canSignal and flat and barstate.isconfirmed
+
+// ═══ 손절/익절 및 주문 ═══
+priceStopPct = maxLossPct / leverage / 100.0
+var float slLvl = na
+var float tp1Lvl = na
+var float tp2Lvl = na
+var float entryPx = na
+var bool  beMoved = false
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+    entryPx := close
+    isLong = longSignal
+    slCap = isLong ? entryPx * (1 - priceStopPct) : entryPx * (1 + priceStopPct)
+    slSwing = isLong ? ta.lowest(low, swingLen) - 0.5 * atr : ta.highest(high, swingLen) + 0.5 * atr
+    slLvl := isLong ? math.max(slCap, slSwing) : math.min(slCap, slSwing)
+    if (isLong and slLvl >= entryPx) or (not isLong and slLvl <= entryPx)
+        slLvl := slCap
+    r = math.abs(entryPx - slLvl)
+    tp1Lvl := isLong ? entryPx + r * tp1R : entryPx - r * tp1R
+    tp2Lvl := isLong ? entryPx + r * tp2R : entryPx - r * tp2R
+    beMoved := false
+    strategy.entry(isLong ? "롱" : "숏", isLong ? strategy.long : strategy.short, qty=strategy.equity * leverage / close)
+
+// TP1 레벨 터치 시 잔량 손절을 본절로 이동 (tp1Pct=0 모드에서도 동작)
+if strategy.position_size > 0 and high >= tp1Lvl
+    beMoved := true
+if strategy.position_size < 0 and low <= tp1Lvl
+    beMoved := true
+effStop = beMoved ? entryPx : slLvl
+
+if strategy.position_size != 0
+    from = strategy.position_size > 0 ? "롱" : "숏"
+    if tp1Pct > 0
+        strategy.exit("TP1/SL", from_entry=from, qty_percent=tp1Pct, limit=tp1Lvl, stop=effStop)
+    strategy.exit("TP2/SL", from_entry=from, qty_percent=100, limit=tp2Lvl, stop=effStop)
+
+// ═══ 차트 표시 ═══
+plot(ema20,  "EMA 20",  color=color.new(color.yellow, 0))
+plot(ema50,  "EMA 50",  color=color.new(color.orange, 0))
+plot(ema200, "EMA 200", color=color.new(color.purple, 0), linewidth=2)
+plot(strategy.position_size != 0 ? effStop : na, "손절선", color=color.red,   style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp1Lvl  : na, "TP1",   color=color.green, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp2Lvl  : na, "TP2",   color=color.lime,  style=plot.style_linebr)
+plotshape(longSignal,  "롱", shape.triangleup,   location.belowbar, color.new(color.teal, 0),   size=size.small)
+plotshape(shortSignal, "숏", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size=size.small)

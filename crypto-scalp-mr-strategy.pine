@@ -1,0 +1,62 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// 단기 평균회귀 스캘핑 — 백테스트용 strategy() 버전
+// crypto-scalp-mr-signals.pine (지표)과 동일 로직.
+// 사용법: BITGET/BYBIT 무기한 심볼의 30분봉(권장) 또는 15분봉(실험)에 올려
+//         Strategy Tester로 2024~2026 성과를 검증한 뒤 사용 여부를 결정.
+// 검증 근거 (backtest/RESULTS.md 9차): 30m 5심볼 2년 3,056 트레이드,
+//   승률 46.6% · PF 1.18(혼합 수수료)/1.14(테이커) · 심볼별 MDD -15~-30%.
+// 주의: 수수료 민감 전략 — commission_value를 본인 실제 등급으로 설정할 것.
+//        지정가 진입 시 0.02~0.0375 권장, 시장가만 쓰면 0.055.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("스캘핑 MR 전략 [백테스트]", shorttitle="스캘핑 MR BT", overlay=true,
+  initial_capital=1000, currency=currency.USDT,
+  commission_type=strategy.commission.percent, commission_value=0.0375,
+  process_orders_on_close=true, calc_on_every_tick=false, max_labels_count=500)
+
+// ═══ 입력값 (지표 버전과 동일) ═══
+rsiTh   = input.float(5, "RSI(2) 극단 기준", minval=1, maxval=20, step=1, group="신호")
+emaLen  = input.int(200, "추세 게이트 EMA", group="신호")
+cooldown = input.int(5, "신호 쿨다운 (봉)", group="신호")
+atrMult = input.float(2.5, "손절 = ATR × 배수", minval=1.0, step=0.5, group="청산")
+timeStopBars = input.int(16, "시간 청산 (N봉 후 종가 청산)", minval=4, group="청산")
+posPct  = input.float(50, "포지션 비중 (자본의 %)", minval=5, maxval=200, step=5, group="리스크")
+maxLossPct = input.float(1.25, "원금 대비 최대 손실 한도 (%)", minval=0.25, step=0.25, group="리스크")
+
+// ═══ 신호 ═══
+ema200 = ta.ema(close, emaLen)
+rsi2 = ta.rsi(close, 2)
+atr = ta.atr(14)
+
+var int lastSignalBar = -99999
+canSignal = bar_index - lastSignalBar > cooldown
+flat = strategy.position_size == 0
+longSignal  = close > ema200 and rsi2 < rsiTh and canSignal and flat and barstate.isconfirmed
+shortSignal = close < ema200 and rsi2 > 100 - rsiTh and not longSignal and canSignal and flat and barstate.isconfirmed
+
+lev = posPct / 100.0
+capStopFrac = maxLossPct / math.max(lev, 0.01) / 100.0
+
+var float slLvl = na
+var int entryBar = na
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+    entryBar := bar_index
+    isLong = longSignal
+    slAtr = isLong ? close - atrMult * atr : close + atrMult * atr
+    slCap = isLong ? close * (1 - capStopFrac) : close * (1 + capStopFrac)
+    slLvl := isLong ? math.max(slAtr, slCap) : math.min(slAtr, slCap)
+    strategy.entry(isLong ? "롱" : "숏", isLong ? strategy.long : strategy.short, qty=strategy.equity * lev / close)
+
+if strategy.position_size != 0
+    strategy.exit("SL", from_entry=strategy.position_size > 0 ? "롱" : "숏", stop=slLvl)
+    // 시간 청산: 목표가 없음 — N봉 경과 시 종가 청산 (평균회귀 완료 가정)
+    if bar_index - entryBar >= timeStopBars
+        strategy.close_all(comment="시간청산")
+
+// ═══ 차트 표시 ═══
+plot(ema200, "EMA 200", color=color.new(color.purple, 0), linewidth=2)
+plot(strategy.position_size != 0 ? slLvl : na, "손절선", color=color.red, style=plot.style_linebr)
+plotshape(longSignal,  "롱", shape.triangleup,   location.belowbar, color.new(color.teal, 0),   size=size.small)
+plotshape(shortSignal, "숏", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size=size.small)

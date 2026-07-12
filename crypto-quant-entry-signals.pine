@@ -1,0 +1,245 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// 퀀트 진입 타점 시그널 [BB + RSI + MACD + EMA + 다이버전스]
+//
+// 목적    : 비트겟/바이비트 등 무기한 선물 트레이딩 시 고확률 진입 타점 포착
+// 구성    : EMA 추세 필터 + 볼린저 밴드 지지/저항 + RSI 과매수·과매도 +
+//           RSI 다이버전스 + MACD 모멘텀 반전 확인
+// 리스크  : 진입 시 "원금 대비 최대 손실 한도(예: -10%)"를 레버리지에 맞춰
+//           가격 기준 스탑로스로 자동 환산. 구조적 스탑(스윙 저점/고점)과
+//           비교하여 더 타이트한 쪽을 채택 → 손실이 한도를 절대 넘지 않음
+// 익절    : 손절폭(R) 기준 1차 목표(보수적) / 2차 목표(공격적) 분할 익절
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("퀀트 진입 타점 [BB+RSI+MACD+EMA+다이버전스]", shorttitle="퀀트 타점", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ═══════════════════════════ 1. 입력값 ═══════════════════════════
+grpTrend  = "① 추세 (EMA)"
+emaFastLen  = input.int(20,  "단기 EMA", minval=1, group=grpTrend)
+emaMidLen   = input.int(50,  "중기 EMA", minval=1, group=grpTrend)
+emaSlowLen  = input.int(200, "장기 EMA", minval=1, group=grpTrend)
+useTrendFilter = input.bool(false, "추세 필터 사용 (EMA200 위=롱만 / 아래=숏만)", group=grpTrend)
+
+grpBB = "② 볼린저 밴드"
+bbLen  = input.int(20, "기간", minval=1, group=grpBB)
+bbMult = input.float(2.0, "표준편차 배수", minval=0.5, step=0.1, group=grpBB)
+bbLookback = input.int(5, "밴드 터치 인정 봉 수 (최근 N봉 내 터치)", minval=1, group=grpBB)
+
+grpRSI = "③ RSI"
+rsiLen = input.int(14, "기간", minval=1, group=grpRSI)
+rsiOB  = input.float(70, "과매수 기준", group=grpRSI)
+rsiOS  = input.float(30, "과매도 기준", group=grpRSI)
+osLookback = input.int(5, "과매수/과매도 인정 봉 수 (최근 N봉 내 진입)", minval=1, group=grpRSI)
+
+grpDiv = "④ RSI 다이버전스"
+lbL = input.int(5, "피벗 왼쪽 봉 수", minval=1, group=grpDiv)
+lbR = input.int(3, "피벗 오른쪽 봉 수 (작을수록 빠른 확정)", minval=1, group=grpDiv)
+rangeLower = input.int(5,  "피벗 간 최소 간격", minval=1, group=grpDiv)
+rangeUpper = input.int(60, "피벗 간 최대 간격", minval=2, group=grpDiv)
+divLookback = input.int(5, "다이버전스 인정 봉 수 (확정 후 N봉 내 유효)", minval=1, group=grpDiv)
+
+grpMACD = "⑤ MACD"
+macdFast = input.int(12, "단기", minval=1, group=grpMACD)
+macdSlow = input.int(26, "장기", minval=1, group=grpMACD)
+macdSig  = input.int(9,  "시그널", minval=1, group=grpMACD)
+
+grpRisk = "⑥ 리스크 관리 (필수 확인!)"
+capital    = input.float(1000, "운용 원금 (USDT)", minval=1, group=grpRisk)
+leverage   = input.float(5,    "레버리지 (배)", minval=1, step=0.5, group=grpRisk)
+maxLossPct = input.float(10,   "원금 대비 최대 손실 한도 (%)", minval=0.5, step=0.5, group=grpRisk, tooltip="예: 10% 입력 + 5배 레버리지 → 가격이 -2% 움직이면 손절 (원금의 -10% 손실)")
+useSwingSL = input.bool(true,  "구조적 스탑 병행 (스윙 저점/고점 ± 0.5×ATR)", group=grpRisk, tooltip="구조적 스탑이 한도 스탑보다 타이트하면 구조적 스탑을 채택. 손실은 어떤 경우에도 한도를 초과하지 않음")
+swingLen   = input.int(10, "스윙 고/저점 탐색 봉 수", minval=2, group=grpRisk)
+
+grpTP = "⑦ 분할 익절"
+tp1R = input.float(1.0, "1차 목표 (보수적, R배수)", minval=0.1, step=0.1, group=grpTP, tooltip="R = 진입가와 손절가의 거리. 1.0 = 손실 리스크와 같은 폭의 수익에서 1차 익절")
+tp2R = input.float(2.0, "2차 목표 (공격적, R배수)", minval=0.2, step=0.1, group=grpTP)
+
+grpSig = "⑧ 신호 설정"
+requireDiv = input.bool(true, "다이버전스 필수 (백테스트 근거로 기본 켜짐 — 끄면 신호 급증, 검증상 손실)", group=grpSig, tooltip="2017~2019 BTC 백테스트: 과매도/과매수 단독 진입은 전 구간 손실(PF 0.6), 다이버전스 필수 시 4h 승률 57%·PF 1.48. 상세는 backtest/RESULTS.md")
+useAdxFilter = input.bool(true, "ADX 레인지 필터 (강한 추세장에서 역추세 진입 차단)", group=grpSig, tooltip="다중 자산·다중 시장 백테스트에서 가장 큰 개선 요인. ADX(14)가 기준 미만인 레인지 장세에서만 진입. 필터 없음 PF 1.02 → ADX<25 PF 1.50~1.65. 상세는 backtest/RESULTS.md 2차 검증")
+adxMax = input.float(20, "ADX 상한 (이 값 미만일 때만 진입)", minval=10, maxval=50, step=1, group=grpSig, tooltip="3차 개편(2024~2026 실전 검증 피드백)으로 기본 25→20. 더 엄격한 레인지 필터로 수수료 대비 신호 질 향상 (검증 PF 1.65→2.00)")
+useShortTrendFilter = input.bool(false, "숏은 EMA200 아래에서만 (완만한 상승장 숏 차단)", group=grpSig, tooltip="2024~2026처럼 완만하게 우상향하는 장에서 역추세 숏이 깎일 때 켜는 옵션. 2017~2019 검증 데이터에서는 성과를 낮췄으므로 기본 꺼짐 — 본인 심볼/기간에서 Strategy Tester로 A/B 후 결정")
+cooldown   = input.int(10, "신호 재발생 최소 간격 (봉)", minval=0, group=grpSig)
+showTable  = input.bool(true, "상태 요약 테이블 표시", group=grpSig)
+
+// ═══════════════════════════ 2. 지표 계산 ═══════════════════════════
+emaFast = ta.ema(close, emaFastLen)
+emaMid  = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+bbBasis = ta.sma(close, bbLen)
+bbDev   = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+rsi = ta.rsi(close, rsiLen)
+
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+
+atr = ta.atr(14)
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// ═══════════════════════════ 3. 다이버전스 감지 ═══════════════════════════
+_inRange(cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+// ── 상승 다이버전스 (가격 저점 하락 + RSI 저점 상승) ──
+plFound = not na(ta.pivotlow(rsi, lbL, lbR))
+rsiHL   = rsi[lbR] > ta.valuewhen(plFound, rsi[lbR], 1) and _inRange(plFound[1])
+priceLL = low[lbR] < ta.valuewhen(plFound, low[lbR], 1)
+bullDiv = plFound and rsiHL and priceLL
+
+// ── 하락 다이버전스 (가격 고점 상승 + RSI 고점 하락) ──
+phFound = not na(ta.pivothigh(rsi, lbL, lbR))
+rsiLH   = rsi[lbR] < ta.valuewhen(phFound, rsi[lbR], 1) and _inRange(phFound[1])
+priceHH = high[lbR] > ta.valuewhen(phFound, high[lbR], 1)
+bearDiv = phFound and rsiLH and priceHH
+
+bullDivRecent = ta.barssince(bullDiv) <= divLookback
+bearDivRecent = ta.barssince(bearDiv) <= divLookback
+
+// ═══════════════════════════ 4. 진입 조건 ═══════════════════════════
+// ── 공통 부품 ──
+oversoldRecent   = ta.barssince(rsi < rsiOS) <= osLookback   // 최근 과매도 진입
+overboughtRecent = ta.barssince(rsi > rsiOB) <= osLookback   // 최근 과매수 진입
+bbLowerTouch = ta.barssince(low  <= bbLower) <= bbLookback   // BB 하단 터치
+bbUpperTouch = ta.barssince(high >= bbUpper) <= bbLookback   // BB 상단 터치
+macdTurnUp   = (hist > hist[1] and hist[1] <= hist[2]) or ta.crossover(macdLine, signalLine)   // 모멘텀 상방 전환
+macdTurnDown = (hist < hist[1] and hist[1] >= hist[2]) or ta.crossunder(macdLine, signalLine)  // 모멘텀 하방 전환
+trendOkLong  = not useTrendFilter or close > emaSlow
+trendOkShort = not useTrendFilter or close < emaSlow
+
+regimeOk     = not useAdxFilter or adxVal < adxMax   // 레인지 장세 확인 (역추세 전략 보호)
+// ── 롱: (과매도 or 상승다이버전스) + BB 하단 지지 + MACD 상방 전환 + 레인지 장세 ──
+longTrigger  = (oversoldRecent or bullDivRecent) and (not requireDiv or bullDivRecent) and bbLowerTouch and macdTurnUp and trendOkLong and regimeOk
+shortSideOk  = not useShortTrendFilter or close < emaSlow
+// ── 숏: (과매수 or 하락다이버전스) + BB 상단 저항 + MACD 하방 전환 + 레인지 장세 ──
+shortTrigger = (overboughtRecent or bearDivRecent) and (not requireDiv or bearDivRecent) and bbUpperTouch and macdTurnDown and trendOkShort and regimeOk and shortSideOk
+
+// ── 쿨다운: 직전 신호 후 일정 봉 수 이내 재신호 금지 ──
+var int lastSignalBar = -99999
+canSignal = bar_index - lastSignalBar > cooldown
+
+longSignal  = longTrigger and canSignal and barstate.isconfirmed
+shortSignal = shortTrigger and not longTrigger and canSignal and barstate.isconfirmed
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+
+// ═══════════════════════════ 5. 손절/익절 레벨 계산 ═══════════════════════════
+// 한도 스탑: 원금 손실 한도(%) ÷ 레버리지 = 허용 가격 변동폭(%)
+priceStopPct = maxLossPct / leverage / 100.0
+
+f_levels(bool isLong) =>
+    entry = close
+    slCap = isLong ? entry * (1 - priceStopPct) : entry * (1 + priceStopPct)
+    slSwing = isLong ? ta.lowest(low, swingLen) - 0.5 * atr : ta.highest(high, swingLen) + 0.5 * atr
+    // 롱: 더 높은(타이트한) 스탑 채택 / 숏: 더 낮은 스탑 채택 → 손실이 한도를 초과하지 않음
+    sl = not useSwingSL ? slCap : isLong ? math.max(slCap, slSwing) : math.min(slCap, slSwing)
+    r  = math.abs(entry - sl)
+    tp1 = isLong ? entry + r * tp1R : entry - r * tp1R
+    tp2 = isLong ? entry + r * tp2R : entry - r * tp2R
+    [entry, sl, tp1, tp2, r]
+
+// 실제 손실률(원금 대비) 및 포지션 정보
+f_riskInfo(float entry, float sl) =>
+    lossPctOfCapital = math.abs(entry - sl) / entry * leverage * 100
+    posSize = capital * leverage            // 포지션 명목가치 (USDT)
+    qty     = posSize / entry               // 수량
+    [lossPctOfCapital, posSize, qty]
+
+// ═══════════════════════════ 6. 신호 시각화 ═══════════════════════════
+f_reasons(bool isLong) =>
+    string s = ""
+    if isLong
+        s += oversoldRecent ? "· RSI 과매도(" + str.tostring(rsi, "#.#") + ") 반등 시도\n" : ""
+        s += bullDivRecent ? "· RSI 상승 다이버전스 확정\n" : ""
+        s += bbLowerTouch ? "· BB 하단 터치 후 지지\n" : ""
+        s += macdTurnUp ? "· MACD 모멘텀 상방 전환\n" : ""
+        s += "· ADX " + str.tostring(adxVal, "#.#") + " 레인지 장세 (역추세 진입 적합)\n"
+        s += close > emaSlow ? "· EMA200 위 (상승 추세 유지)\n" : "· ⚠ EMA200 아래 (역추세 반등 주의)\n"
+    else
+        s += overboughtRecent ? "· RSI 과매수(" + str.tostring(rsi, "#.#") + ") 반락 시도\n" : ""
+        s += bearDivRecent ? "· RSI 하락 다이버전스 확정\n" : ""
+        s += bbUpperTouch ? "· BB 상단 터치 후 저항\n" : ""
+        s += macdTurnDown ? "· MACD 모멘텀 하방 전환\n" : ""
+        s += "· ADX " + str.tostring(adxVal, "#.#") + " 레인지 장세 (역추세 진입 적합)\n"
+        s += close < emaSlow ? "· EMA200 아래 (하락 추세 유지)\n" : "· ⚠ EMA200 위 (역추세 반락 주의)\n"
+    s
+
+f_drawSignal(bool isLong) =>
+    [entry, sl, tp1, tp2, r] = f_levels(isLong)
+    [lossPct, posSize, qty] = f_riskInfo(entry, sl)
+    dir = isLong ? "롱(LONG) 진입 후보" : "숏(SHORT) 진입 후보"
+    txt = "◆ " + dir + " ◆\n"
+      + "진입가: " + str.tostring(entry, format.mintick) + "\n"
+      + "손절가: " + str.tostring(sl, format.mintick) + "  (원금 " + str.tostring(-lossPct, "#.##") + "%)\n"
+      + "1차 익절(보수): " + str.tostring(tp1, format.mintick) + "  (" + str.tostring(tp1R, "#.#") + "R, 30% 청산 권장)\n"
+      + "2차 익절(공격): " + str.tostring(tp2, format.mintick) + "  (" + str.tostring(tp2R, "#.#") + "R, 잔량 청산)\n"
+      + "권장 수량: " + str.tostring(qty, "#.####") + " (" + str.tostring(leverage, "#.#") + "x, " + str.tostring(posSize, "#") + " USDT)\n"
+      + "─── 근거 ───\n" + f_reasons(isLong)
+    label.new(bar_index, isLong ? low : high, txt,
+      style=isLong ? label.style_label_up : label.style_label_down,
+      color=isLong ? color.new(color.teal, 10) : color.new(color.maroon, 10),
+      textcolor=color.white, size=size.small, textalign=text.align_left)
+    // 레벨 라인 (진입/손절/익절)
+    ext = 20
+    line.new(bar_index, entry, bar_index + ext, entry, color=color.gray,   width=1, style=line.style_solid)
+    line.new(bar_index, sl,    bar_index + ext, sl,    color=color.red,    width=2, style=line.style_dashed)
+    line.new(bar_index, tp1,   bar_index + ext, tp1,   color=color.green,  width=1, style=line.style_dotted)
+    line.new(bar_index, tp2,   bar_index + ext, tp2,   color=color.lime,   width=2, style=line.style_dotted)
+    label.new(bar_index + ext, sl,  "SL "  + str.tostring(sl,  format.mintick), style=label.style_label_left, color=color.new(color.red,   70), textcolor=color.white, size=size.tiny)
+    label.new(bar_index + ext, tp1, "TP1 " + str.tostring(tp1, format.mintick), style=label.style_label_left, color=color.new(color.green, 70), textcolor=color.white, size=size.tiny)
+    label.new(bar_index + ext, tp2, "TP2 " + str.tostring(tp2, format.mintick), style=label.style_label_left, color=color.new(color.lime,  70), textcolor=color.white, size=size.tiny)
+
+if longSignal
+    f_drawSignal(true)
+if shortSignal
+    f_drawSignal(false)
+
+// ═══════════════════════════ 7. 차트 표시 ═══════════════════════════
+plot(emaFast, "EMA 20",  color=color.new(color.yellow, 0), linewidth=1)
+plot(emaMid,  "EMA 50",  color=color.new(color.orange, 0), linewidth=1)
+plot(emaSlow, "EMA 200", color=color.new(color.purple, 0), linewidth=2)
+
+pBBU = plot(bbUpper, "BB 상단", color=color.new(color.blue, 55))
+pBBL = plot(bbLower, "BB 하단", color=color.new(color.blue, 55))
+plot(bbBasis, "BB 중심", color=color.new(color.blue, 70))
+fill(pBBU, pBBL, color=color.new(color.blue, 96), title="BB 영역")
+
+// 다이버전스 확정 지점 표시 (피벗 위치 기준)
+plotshape(bullDiv ? low[lbR] : na,  "상승 다이버전스", shape.labelup,   location.absolute, color.new(color.green, 20), offset=-lbR, text="Bull Div", textcolor=color.white, size=size.tiny)
+plotshape(bearDiv ? high[lbR] : na, "하락 다이버전스", shape.labeldown, location.absolute, color.new(color.red, 20),   offset=-lbR, text="Bear Div", textcolor=color.white, size=size.tiny)
+
+// 진입 신호 마커
+plotshape(longSignal,  "롱 신호", shape.triangleup,   location.belowbar, color.new(color.teal, 0),   size=size.small)
+plotshape(shortSignal, "숏 신호", shape.triangledown, location.abovebar, color.new(color.maroon, 0), size=size.small)
+
+// ═══════════════════════════ 8. 상태 요약 테이블 ═══════════════════════════
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.new(color.gray, 60))
+if showTable and barstate.islast
+    trendTxt  = close > emaSlow ? (emaFast > emaMid ? "강한 상승" : "상승(조정)") : (emaFast < emaMid ? "강한 하락" : "하락(반등)")
+    trendCol  = close > emaSlow ? color.green : color.red
+    rsiTxt    = str.tostring(rsi, "#.#") + (rsi > rsiOB ? " 과매수" : rsi < rsiOS ? " 과매도" : " 중립")
+    rsiCol    = rsi > rsiOB ? color.red : rsi < rsiOS ? color.green : color.gray
+    macdTxt   = hist > 0 ? (hist > hist[1] ? "상승 확대" : "상승 축소") : (hist < hist[1] ? "하락 확대" : "하락 축소")
+    macdCol   = hist > 0 ? color.green : color.red
+    bbPos     = close > bbUpper ? "상단 돌파" : close < bbLower ? "하단 이탈" : close > bbBasis ? "중심선 위" : "중심선 아래"
+    divTxt    = bullDivRecent ? "상승 Div 유효" : bearDivRecent ? "하락 Div 유효" : "없음"
+    divCol    = bullDivRecent ? color.green : bearDivRecent ? color.red : color.gray
+    slPctTxt  = "-" + str.tostring(priceStopPct * 100, "#.##") + "% (원금 -" + str.tostring(maxLossPct, "#.#") + "%)"
+    table.cell(t, 0, 0, "추세(EMA)",   text_color=color.white, text_size=size.tiny), table.cell(t, 1, 0, trendTxt, text_color=trendCol, text_size=size.tiny)
+    table.cell(t, 0, 1, "RSI",         text_color=color.white, text_size=size.tiny), table.cell(t, 1, 1, rsiTxt,   text_color=rsiCol,   text_size=size.tiny)
+    table.cell(t, 0, 2, "MACD",        text_color=color.white, text_size=size.tiny), table.cell(t, 1, 2, macdTxt,  text_color=macdCol,  text_size=size.tiny)
+    table.cell(t, 0, 3, "BB 위치",     text_color=color.white, text_size=size.tiny), table.cell(t, 1, 3, bbPos,    text_color=color.silver, text_size=size.tiny)
+    table.cell(t, 0, 4, "다이버전스",  text_color=color.white, text_size=size.tiny), table.cell(t, 1, 4, divTxt,   text_color=divCol,   text_size=size.tiny)
+    adxTxt = str.tostring(adxVal, "#.#") + (adxVal < adxMax ? " 레인지 (진입 가능)" : " 추세 (진입 차단)")
+    adxCol = adxVal < adxMax ? color.green : color.red
+    table.cell(t, 0, 5, "ADX 장세",   text_color=color.white, text_size=size.tiny), table.cell(t, 1, 5, adxTxt,   text_color=adxCol,   text_size=size.tiny)
+    table.cell(t, 0, 6, "한도 손절폭", text_color=color.white, text_size=size.tiny), table.cell(t, 1, 6, slPctTxt, text_color=color.orange, text_size=size.tiny)
+
+// ═══════════════════════════ 9. 알림 ═══════════════════════════
+alertcondition(longSignal,  "롱 진입 신호",  "퀀트 타점: 롱 진입 후보 발생 - 차트에서 진입가/손절가/익절가를 확인하세요")
+alertcondition(shortSignal, "숏 진입 신호",  "퀀트 타점: 숏 진입 후보 발생 - 차트에서 진입가/손절가/익절가를 확인하세요")
+alertcondition(bullDiv, "상승 다이버전스", "퀀트 타점: RSI 상승 다이버전스 확정")
+alertcondition(bearDiv, "하락 다이버전스", "퀀트 타점: RSI 하락 다이버전스 확정")
