@@ -59,6 +59,7 @@ class Config:
     short_only_trend: bool = False      # 숏만 EMA200 아래에서 허용 (완만한 상승장 숏 차단)
     htf_rule: str = ""            # 상위 타임프레임 규칙 (예: "1D") — 설정 시 HTF ADX 게이트 활성
     htf_adx_max: float = 25.0     # HTF ADX가 이 값 미만일 때만 진입 (전일 확정값 사용, 미래참조 없음)
+    time_stop_bars: int = 0       # >0이면 N봉 경과 시 종가 청산 (스캘핑용 시간 손절)
     # 리스크
     capital: float = 1000.0
     leverage: float = 5.0
@@ -292,10 +293,16 @@ def run_backtest(df: pd.DataFrame, c: Config, signal_fn=None):
                         buf = 0.25 * pos["rr"]
                         pos["sl"] = pos["entry"] + buf if side == "L" else pos["entry"] - buf
                     # "none"이면 원래 손절가 유지
-                if pos["half_done"] and hit_tp2:
+                # TP1 비활성(청산 비중 0)일 때도 TP2는 독립적으로 발동해야 한다
+                if (pos["half_done"] or c.tp1_exit_frac <= 0) and hit_tp2:
                     close_qty(pos["qty"], pos["tp2"])
-                    t.outcome = "TP1+TP2"
+                    t.outcome = "TP1+TP2" if pos["half_done"] else "TP2"
                     filled_exit = True
+            # 시간 청산: N봉 경과 시 종가로 전량 정리
+            if (not filled_exit) and c.time_stop_bars > 0 and i - pos["i0"] >= c.time_stop_bars:
+                close_qty(pos["qty"], cl[i])
+                t.outcome = "TIME"
+                filled_exit = True
             if filled_exit:
                 t.exit_time = times[i]
                 t.pnl_pct_capital = (equity - pos["eq0"]) / pos["eq0"] * 100
@@ -333,7 +340,7 @@ def run_backtest(df: pd.DataFrame, c: Config, signal_fn=None):
                 notional = equity * c.leverage
                 qty = notional / entry
                 equity -= notional * c.taker_fee  # 진입 수수료
-                pos = dict(side="L" if is_long else "S", entry=entry, sl=sl, tp1=tp1, tp2=tp2, rr=rr,
+                pos = dict(side="L" if is_long else "S", entry=entry, sl=sl, tp1=tp1, tp2=tp2, rr=rr, i0=i,
                            qty=qty, half_done=False, eq0=equity + notional * c.taker_fee,
                            trade=Trade("LONG" if is_long else "SHORT", times[i], entry, sl, tp1, tp2))
 
